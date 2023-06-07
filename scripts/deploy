@@ -146,7 +146,7 @@ def deploy(rpc, region):
         ["telnet", ip, "22"], stdout=subprocess.PIPE, input="quit".encode()
     ).stdout.decode()
     while "Connected" not in output:
-        print(f"⏳ linode {linode} {rpc} IP: {ip} Waiting for linode to be ready")
+        print(f"⏳ linode {linode} IP: {ip} Waiting for linode to be ready")
         sleep(30)
         output = subprocess.run(
             ["telnet", ip, "22"], stdout=subprocess.PIPE, input="quit".encode()
