@@ -12,17 +12,25 @@ if not SSH_KEY:
     print("❌ SSH_KEY is not set")
     exit(1)
 
-PUBLIC_KEY = SSH_KEY + ".pub"
-
-# Check if SSH_KEY exists
-if not os.path.exists(PUBLIC_KEY):
-    print(f"❌ SSH_KEY {PUBLIC_KEY} does not exist")
-    exit(1)
-
 # Get project root
 project_root = (
     subprocess.check_output(["git", "rev-parse", "--show-toplevel"]).strip().decode()
 )
+
+
+def read_dotenv(name):
+    with open(os.path.join(project_root, ".env"), "r") as f:
+        for line in f:
+            if name in line and "#" not in line:
+                idx = line.index("=")
+                return line[idx + 1 :].strip()
+    raise Exception(f"❌ {name} is not set in .env file")
+
+
+LOKI_URL = read_dotenv("LOKI_URL")
+GRAFANA_URL = read_dotenv("GRAFANA_URL")
+GRAFANA_USERNAME = read_dotenv("GRAFANA_USERNAME")
+GRAFANA_PASSWORD = read_dotenv("GRAFANA_PASSWORD")
 
 regions = [
     "us-east",
@@ -48,17 +56,13 @@ if not regions:
     print("❌ No regions found")
     exit(1)
 
-# Read RPC from .env file
-with open(os.path.join(project_root, ".env"), "r") as f:
-    for line in f:
-        if "RPC" in line and "#" not in line:
-            rpc = urllib.parse.urlparse(
-                line.split("=")[1].strip().replace(".", "-").replace('"', "")
-            ).hostname
+# Read RPCs from rpcs.txt file
+with open(os.path.join(project_root, "rpcs.txt"), "r") as f:
+    rpcs = [line.strip() for line in f]
 
-# Check if RPC is set
-if not rpc:
-    print("❌ RPC is not set in .env file")
+# Check if RPCs are set
+if not rpcs:
+    print("❌ RPCs are not set in rpcs.txt file")
     exit(1)
 
 # Ensure linode user is set up
@@ -77,10 +81,6 @@ if not linode_user:
 # share amongst threads
 root_password = None
 
-print(f"🏋️‍♂️ Deploying BenchETH to {rpc} {' '.join(regions)}")
-
-input("➡️ Press enter to continue or Ctrl+C to cancel")
-
 
 def linode_ip(linode):
     for line in (
@@ -93,20 +93,21 @@ def linode_ip(linode):
             return line.split()[-2]
 
 
-def linode_name(rpc, region):
-    return f"bencheth-{rpc}-{region}"
+def linode_name(host, region):
+    return f"bencheth-{host}-{region}"
 
 
 def deploy(rpc, region):
-    print(f"🤠 Deploying to {region} {rpc}")
-
-    linode = linode_name(rpc, region)
+    hostname = rpc_hostname(rpc)
+    linode = linode_name(hostname, region)
     ip = linode_ip(linode)
+
+    print(f"🤠 Deploying to {region} {hostname}")
 
     if ip:
         print(f"⏩ linode {region} IP: {ip} already exists, skipping creation")
     else:
-        print(f"⏩ Creating linode {region} {rpc}")
+        print(f"⏩ Creating linode {region} {hostname}")
         subprocess.run(
             [
                 "linode-cli",
@@ -137,9 +138,10 @@ def deploy(rpc, region):
                 '{"disable_root": "No","mx":"No","spf":"No"}',
             ]
         )
+        sleep(5)  # stagger creation
         ip = linode_ip(linode)
 
-    print(f"🛜  linode {linode} {rpc} IP: {ip}")
+    print(f"🛜  linode {linode} {hostname} IP: {ip}")
 
     # wait for linode to be ready
     output = subprocess.run(
@@ -166,18 +168,26 @@ def deploy(rpc, region):
         ]
     )
 
-    print(f"🚀 Deploying {region} {rpc} to {ip}")
+    print(f"🚀 Deploying {region} {hostname} to {ip}")
 
     # run deploy script
     deploy_script = f"""cd /root/bencheth
-for i in $(seq 1 10); do
+sudo hostnamectl set-hostname {linode}
+for i in $(seq 1 30); do
     docker ps >/dev/null 2>&1 && break
     echo "⏳ Waiting for docker to be ready"
     sleep 10
 done
+sudo systemctl restart docker # just to be sure
+# set .env file
+echo RPC_URL="{rpc}" > .env
+echo RUST_LOG="debug" >> .env
+echo LOKI_URL={LOKI_URL} >> .env
+echo GRAFANA_URL={GRAFANA_URL} >> .env
+echo GRAFANA_USERNAME={GRAFANA_USERNAME} >> .env
+echo GRAFANA_PASSWORD={GRAFANA_PASSWORD} >> .env
 docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions || true
 sudo ufw allow 9100 # node exporter
-sudo hostnamectl set-hostname {linode}
 docker-compose stop
 docker-compose up --build -d"""
     subprocess.run(
@@ -185,26 +195,38 @@ docker-compose up --build -d"""
         input=deploy_script.encode(),
     )
 
-    print(f"✅ Deployed {region} {rpc} to {ip}")
+    print(f"✅ Deployed {region} {hostname} to {ip}")
 
+
+def rpc_hostname(rpc):
+    return urllib.parse.urlparse(rpc).hostname.replace(".", "-")
+
+
+print(
+    f"""
+🏋️‍♂️ Deploying BenchETH:
+    rpcs: [{','.join([rpc_hostname(rpc) for rpc in rpcs])}]
+    regions: [{','.join(regions)}]
+    """
+)
+
+input("➡️ Press enter to continue or Ctrl+C to cancel")
+root_password = getpass.getpass(f"🔑 Set root password for new linodes: ")
 
 # Deploy to all regions
 threads = []
-for region in regions:
-    # lookup the ip and sniff if we need to set a root password
-    linode = linode_name(rpc, region)
-    ip = linode_ip(linode)
-    if not root_password and not ip:
-        root_password = getpass.getpass(f"🔑 Set root password for new linodes: ")
-    thr = threading.Thread(
-        target=deploy,
-        args=(
-            rpc,
-            region,
-        ),
-    )
-    thr.start()
-    threads.append(thr)
+for rpc in rpcs:
+    for region in regions:
+        thr = threading.Thread(
+            target=deploy,
+            args=(
+                rpc,
+                region,
+            ),
+        )
+        thr.start()
+        sleep(5)  # stagger deploys
+        threads.append(thr)
 
 for thread in threads:
     thread.join()
