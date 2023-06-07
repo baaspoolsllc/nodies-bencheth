@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+import getpass
+import os
+import subprocess
+import threading
+import urllib.parse
+from time import sleep
+
+# Check if SSH_KEY is set
+SSH_KEY = os.environ.get('SSH_KEY')
+if not SSH_KEY:
+    print("❌ SSH_KEY is not set")
+    exit(1)
+
+PUBLIC_KEY = SSH_KEY + '.pub'
+
+# Check if SSH_KEY exists
+if not os.path.exists(PUBLIC_KEY):
+    print(f"❌ SSH_KEY {PUBLIC_KEY} does not exist")
+    exit(1)
+
+# Get project root
+project_root = subprocess.check_output(['git', 'rev-parse', '--show-toplevel']).strip().decode()
+
+regions = [
+    "us-east",
+    "ap-south",
+    "eu-central",
+]
+
+# regions = [
+#     'ap-west',
+#     'ca-central',
+#     'ap-southeast',
+#     'us-central',
+#     'us-west',
+#     'us-southeast',
+#     'us-east',
+#     'eu-west',
+#     'ap-south',
+#     'eu-central',
+#     'ap-northeast',
+# ]
+
+if not regions:
+    print("❌ No regions found")
+    exit(1)
+
+# Read RPC from .env file
+with open(os.path.join(project_root, '.env'), 'r') as f:
+    for line in f:
+        if 'RPC' in line and '#' not in line:
+            rpc = urllib.parse.urlparse(line.split('=')[1].strip().replace('.', '-').replace('\"', '')).hostname
+
+# Check if RPC is set
+if not rpc:
+    print("❌ RPC is not set in .env file")
+    exit(1)
+
+# Ensure linode user is set up
+for line in subprocess.check_output(["linode-cli", "show-users"]).strip().decode().splitlines():
+    if '*' in line:
+        linode_user = line.split()[1]
+        print("👍 linode user is set: " + linode_user)
+        break
+
+if not linode_user:
+    print("❌ linode user is not set up. please run linode-cli configure")
+    exit(1)
+
+# share amongst threads
+root_password = None
+
+print(f"🏋️‍♂️ Deploying BenchETH to {rpc} {' '.join(regions)}")
+
+input("➡️ Press enter to continue or Ctrl+C to cancel")
+
+def linode_ip(linode):
+  ip = None
+  for line in subprocess.check_output(['linode-cli', 'linodes', 'list', '--label', linode]).decode().strip().splitlines():
+        if linode in line:
+            ip = line.split()[-2]
+            break
+  return ip
+
+def deploy(region):
+    linode = f"bencheth-{rpc}-{region}"
+
+    print(f"🤠 Deploying to {region} {rpc}")
+
+    ip = linode_ip(linode)
+
+    if ip:
+        print(f"⏩ linode {region} IP: {ip} already exists, skipping creation")
+    else:
+        print(f"⏩ Creating linode {region} {rpc}")
+        global root_password
+        if not root_password:
+            root_password = getpass.getpass(f"🔑 Enter root password for all linodes: ")
+        subprocess.run(['linode-cli', 'linodes', 'create',
+                        '--no-defaults', # no surprises
+                    '--image', 'linode/ubuntu22.04',
+                    '--region', region,
+                    '--type', 'g6-dedicated-2',
+                    '--label', linode,
+                    '--root_pass', root_password,
+                    '--authorized_users', linode_user,
+                    '--booted', 'true',
+                    '--backups_enabled', 'false',
+                    '--private_ip', 'false',
+                    '--stackscript_id', '607433', # docker
+                    '--stackscript_data', '{"disable_root": "No","mx":"No","spf":"No"}'])
+        ip = linode_ip(linode)
+
+
+    print(f"🛜  linode {linode} {rpc} IP: {ip}")
+
+    # wait for linode to be ready
+    output = subprocess.run(['telnet', ip, '22'], stdout=subprocess.PIPE, input='quit'.encode()).stdout.decode()
+    while "Connected" not in output:
+        print(f"⏳ linode {linode} {rpc} IP: {ip} Waiting for linode to be ready")
+        sleep(30)
+        output = subprocess.run(['telnet', ip, '22'], stdout=subprocess.PIPE, input='quit'.encode()).stdout.decode()
+
+    # rsync deploy
+    subprocess.run(['rsync', '-avz', '-e', f"ssh -i {SSH_KEY} -o StrictHostKeyChecking=no",
+                    '--exclude-from', os.path.join(project_root, 'scripts/deployexclude'),
+                    project_root+"/", f'root@{ip}:/root/bencheth'])
+
+    print(f"🚀 Deploying {region} {rpc} to {ip}")
+
+    # run deploy script
+    deploy_script = f"""cd /root/bencheth
+docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions || true
+sudo ufw allow 9100 # node exporter
+sudo hostnamectl set-hostname {linode}
+docker-compose stop
+docker-compose up --build -d"""
+    subprocess.run(['ssh', '-i', SSH_KEY, '-o', 'StrictHostKeyChecking=no', f'root@{ip}'], input=deploy_script.encode())
+
+    print(f"✅ Deployed {region} {rpc} to {ip}")
+
+# Deploy to all regions
+threads = []
+for region in regions:
+    thr = threading.Thread(target=deploy, args=(region,))
+    thr.start()
+    threads.append(thr)
+
+for thread in threads:
+    thread.join()
+
+print("🎉 All deployments complete")

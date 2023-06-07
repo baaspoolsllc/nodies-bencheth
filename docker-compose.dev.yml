@@ -1,0 +1,7 @@
+version: '3.8'
+
+services:
+  bencheth-1:
+    build:
+      context: .
+      dockerfile: Dockerfile

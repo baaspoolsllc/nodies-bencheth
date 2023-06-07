@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  bencheth-1:
+    deploy:
+      replicas: 1
+    command: ["bencheth"]
+    image: docker.io/0xbigboss/bencheth:0.1.1
+    env_file:
+      - .env
+    logging: &default-logging
+      driver: loki
+      options:
+        loki-url: ${LOKI_URL:-http://localhost:3100/loki/api/v1/push}
+        loki-retries: "5"
+        loki-batch-size: "400"
+        loki-timeout: "1s"
+
+  grafana-agent:
+    image: grafana/agent:latest
+    volumes:
+      - ./grafana-agent.yaml:/etc/grafana-agent.yaml
+    command: ["-config.file=/etc/grafana-agent.yaml", "-config.expand-env=true"]
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  node_exporter:
+    image: quay.io/prometheus/node-exporter:latest
+    container_name: node_exporter
+    command:
+      - '--path.rootfs=/host'
+    network_mode: host
+    pid: host
+    restart: unless-stopped
+    volumes:
+      - '/:/host:ro,rslave'
+
