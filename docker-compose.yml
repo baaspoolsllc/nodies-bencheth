@@ -23,8 +23,11 @@ services:
     command: ["-config.file=/etc/grafana-agent.yaml", "-config.expand-env=true"]
     env_file:
       - .env
+    environment:
+      NODE_EXPORTER_HOSTNAME: ${HOSTNAME:-host.docker.internal}
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "${HOSTNAME:-host.docker.internal}:host-gateway"
+    logging: *default-logging
 
   node_exporter:
     image: quay.io/prometheus/node-exporter:latest
@@ -36,4 +39,5 @@ services:
     restart: unless-stopped
     volumes:
       - '/:/host:ro,rslave'
+    logging: *default-logging
 

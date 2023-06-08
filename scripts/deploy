@@ -101,6 +101,7 @@ def deploy(rpc, region):
     hostname = rpc_hostname(rpc)
     linode = linode_name(hostname, region)
     ip = linode_ip(linode)
+    sleep(2)  # stagger queries
 
     print(f"🤠 Deploying to {region} {hostname}")
 
@@ -138,7 +139,7 @@ def deploy(rpc, region):
                 '{"disable_root": "No","mx":"No","spf":"No"}',
             ]
         )
-        sleep(5)  # stagger creation
+        sleep(2)  # stagger creation
         ip = linode_ip(linode)
 
     print(f"🛜  linode {linode} {hostname} IP: {ip}")
@@ -180,12 +181,12 @@ for i in $(seq 1 30); do
 done
 sudo systemctl restart docker # just to be sure
 # set .env file
-echo RPC_URL="{rpc}" > .env
-echo RUST_LOG="debug" >> .env
-echo LOKI_URL={LOKI_URL} >> .env
-echo GRAFANA_URL={GRAFANA_URL} >> .env
-echo GRAFANA_USERNAME={GRAFANA_USERNAME} >> .env
-echo GRAFANA_PASSWORD={GRAFANA_PASSWORD} >> .env
+echo 'RPC_URL="{rpc}"' > .env
+echo 'RUST_LOG="debug"' >> .env
+echo 'LOKI_URL={LOKI_URL}' >> .env
+echo 'GRAFANA_URL={GRAFANA_URL}' >> .env
+echo 'GRAFANA_USERNAME={GRAFANA_USERNAME}' >> .env
+echo 'GRAFANA_PASSWORD={GRAFANA_PASSWORD}' >> .env
 docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions || true
 sudo ufw allow 9100 # node exporter
 docker-compose stop
@@ -225,7 +226,6 @@ for rpc in rpcs:
             ),
         )
         thr.start()
-        sleep(5)  # stagger deploys
         threads.append(thr)
 
 for thread in threads:
