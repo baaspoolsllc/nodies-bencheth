@@ -226,6 +226,7 @@ for rpc in rpcs:
             ),
         )
         thr.start()
+        sleep(2)  # stagger deployments
         threads.append(thr)
 
 for thread in threads:
