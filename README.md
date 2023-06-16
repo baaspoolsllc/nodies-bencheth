@@ -28,7 +28,23 @@ BenchETH is configured via environment variables. The most important is `RPC_URL
 
 ### Running
 
-TODO
+The easiest way to run this project is using docker compose. You can pair it with tilt for a better development experience.
+
+You will want to create your own `.env` file with your own configuration. You can use the [`.env.example`](.env.example) file as a template.
+
+The most important environment variable is `RPC_URL`, which is the URL of the RPC server to connect to. You can visit [nodies.app](https://nodies.app) to mint a free RPC URL.
+
+If you want to collect and visualize the metrics, you will need to configure the Grafana Cloud environment variables.
+
+#### Docker Compose
+
+```bash
+cp .env.example
+sh -c "$EDITOR .env" # edit the .env file
+docker-compose up
+```
+
+If you have Tilt installed. You can run `tilt up` to get a live development environment.
 
 ### Deploying
 
