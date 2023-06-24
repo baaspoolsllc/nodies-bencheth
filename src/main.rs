@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let geo_region = get_geo_region().await;
 
     log::info!(
-        "[😛-bencheth][🗺️-{}] ➡️ {}:  {:?}",
+        "[😛][🗺️-{}] ➡️ {}:  {:?}",
         geo_region,
         rpc_host,
         env!("CARGO_PKG_VERSION")

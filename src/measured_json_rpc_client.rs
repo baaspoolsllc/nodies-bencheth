@@ -5,7 +5,7 @@ use ethers::{
     prelude::{Http, JsonRpcClient, ProviderError, RetryClientError, RpcError},
     providers::{HttpRateLimitRetryPolicy, RetryClient, RetryClientBuilder},
 };
-use prometheus::{histogram_opts, Counter, Histogram, Registry};
+use prometheus::{histogram_opts, Histogram, IntCounter, IntCounterVec, Opts, Registry};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,9 +67,9 @@ impl From<MeasuredJsonRpcError> for ProviderError {
 /// - `request_errors`: the total number of errors from the RPC URL
 #[derive(Clone, Debug)]
 pub struct Metrics {
-    request_total: Counter,
+    request_total: IntCounter,
     request_latency: Histogram,
-    request_errors: Counter,
+    request_errors: IntCounterVec,
 }
 
 /// We implement a constructor method for our metrics, which will initialize the metrics and
@@ -77,15 +77,18 @@ pub struct Metrics {
 impl Metrics {
     fn new(registry: &Registry) -> Self {
         let request_total =
-            Counter::new("request_total", "Total number of requests made to RPC URL")
+            IntCounter::new("request_total", "Total number of requests made to RPC URL")
                 .expect("could not create request_total counter");
         let request_latency = Histogram::with_opts(histogram_opts!(
             "request_latency",
             "The time taken for RPC URL to respond"
         ))
         .expect("could not create request_latency histogram");
-        let request_errors = Counter::new("request_errors", "Total number of errors from RPC URL")
-            .expect("could not create request_errors counter");
+        let request_errors = IntCounterVec::new(
+            Opts::new("request_errors", "Total number of errors from RPC URL"),
+            &["code"],
+        )
+        .expect("could not create request_errors counter");
         registry
             .register(Box::new(request_total.clone()))
             .expect("could not register request_total counter");
@@ -157,7 +160,50 @@ impl JsonRpcClient for MeasuredJsonRpc {
 
         match &res {
             Ok(_) => {}
-            Err(_) => self.metrics.request_errors.inc(),
+            Err(error) => {
+                // track error by status code, etc.
+                match error {
+                    RetryClientError::ProviderError(err) => {
+                        // check for json rpc error codes
+                        if let Some(code) = err.as_error_response().map(|e| e.code) {
+                            log::debug!("json rpc error: {}", code);
+                            self.metrics
+                                .request_errors
+                                .with_label_values(&[&code.to_string()])
+                                .inc();
+                        } else if let ProviderError::HTTPError(_err) = err {
+                            // check for http error codes
+                            if let Some(status) = _err.status() {
+                                log::debug!("http error: {}", status);
+                                self.metrics
+                                    .request_errors
+                                    .with_label_values(&[&status.as_str()])
+                                    .inc();
+                            }
+                        } else {
+                            log::debug!("unknown error");
+                            self.metrics
+                                .request_errors
+                                .with_label_values(&["unknown"])
+                                .inc();
+                        }
+                    }
+                    RetryClientError::SerdeJson(_) => {
+                        log::debug!("serde json error");
+                        self.metrics
+                            .request_errors
+                            .with_label_values(&["serde_json"])
+                            .inc();
+                    }
+                    &RetryClientError::TimeoutError => {
+                        log::debug!("timeout error");
+                        self.metrics
+                            .request_errors
+                            .with_label_values(&["timeout"])
+                            .inc();
+                    }
+                }
+            }
         }
 
         res.map_err(Into::into)
