@@ -157,7 +157,30 @@ impl JsonRpcClient for MeasuredJsonRpc {
 
         match &res {
             Ok(_) => {}
-            Err(_) => self.metrics.request_errors.inc(),
+            Err(error) => {
+                // TODO: track error by status code, etc.
+                // copied from `ethers-providers-2.0.6/src/rpc/transports/retry.rs'`
+                // match error {
+                //     ClientError::ReqwestError(err) => {
+                //         err.status() == Some(http::StatusCode::TOO_MANY_REQUESTS)
+                //     }
+                //     ClientError::JsonRpcError(err) => should_retry_json_rpc_error(err),
+                //     ClientError::SerdeJson { text, .. } => {
+                //         // some providers send invalid JSON RPC in the error case (no `id:u64`), but the
+                //         // text should be a `JsonRpcError`
+                //         #[derive(Deserialize)]
+                //         struct Resp {
+                //             error: JsonRpcError,
+                //         }
+
+                //         if let Ok(resp) = serde_json::from_str::<Resp>(text) {
+                //             return should_retry_json_rpc_error(&resp.error);
+                //         }
+                //         false
+                //     }
+                // }
+                self.metrics.request_errors.inc();
+            }
         }
 
         res.map_err(Into::into)
