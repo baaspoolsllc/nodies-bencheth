@@ -3,7 +3,7 @@ version: '3.8'
 services:
   bencheth-1:
     deploy:
-      replicas: 0
+      replicas: 1
     command: ["bencheth"]
     image: docker.io/0xbigboss/bencheth:0.1.1
     env_file:
