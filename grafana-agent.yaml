@@ -7,7 +7,7 @@ metrics:
         - job_name: node-${HOSTNAME}
           static_configs:
             - targets:
-                - bencheth-1:3030
+                - bencheth-1:9090
         - job_name: node-${HOSTNAME}-exporter
           static_configs:
             - targets:
