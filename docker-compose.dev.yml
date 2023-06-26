@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   bencheth-1:
+    image: docker.io/0xbigboss/bencheth:0.1.3
     build:
       context: .
       dockerfile: Dockerfile
