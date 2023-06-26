@@ -3,10 +3,13 @@
 use async_trait::async_trait;
 use ethers::{
     prelude::{Http, JsonRpcClient, ProviderError, RetryClientError, RpcError},
-    providers::{HttpRateLimitRetryPolicy, RetryClient, RetryClientBuilder},
+    providers::{
+        HttpClientError, HttpRateLimitRetryPolicy, JsonRpcError, RetryClient, RetryClientBuilder,
+        RetryPolicy,
+    },
 };
 use prometheus::{histogram_opts, Histogram, IntCounter, IntCounterVec, Opts, Registry};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt::Debug, str::FromStr};
@@ -69,7 +72,6 @@ impl From<MeasuredJsonRpcError> for ProviderError {
 pub struct Metrics {
     request_total: IntCounter,
     request_latency: Histogram,
-    request_errors: IntCounterVec,
 }
 
 /// We implement a constructor method for our metrics, which will initialize the metrics and
@@ -84,26 +86,116 @@ impl Metrics {
             "The time taken for RPC URL to respond"
         ))
         .expect("could not create request_latency histogram");
-        let request_errors = IntCounterVec::new(
-            Opts::new("request_errors", "Total number of errors from RPC URL"),
-            &["code"],
-        )
-        .expect("could not create request_errors counter");
         registry
             .register(Box::new(request_total.clone()))
             .expect("could not register request_total counter");
         registry
             .register(Box::new(request_latency.clone()))
             .expect("could not register request_latency histogram");
+        Self {
+            request_total,
+            request_latency,
+        }
+    }
+}
+
+/// Create a measured retry policy that will track the number of errors from the RPC URL.
+#[derive(Debug)]
+pub struct MeasuredHttpRateLimitRetryPolicy {
+    request_errors: Arc<IntCounterVec>,
+    default_policy: HttpRateLimitRetryPolicy,
+}
+
+impl MeasuredHttpRateLimitRetryPolicy {
+    pub fn new(registry: &Registry) -> Self {
+        let request_errors = IntCounterVec::new(
+            Opts::new("request_errors", "Total number of errors from RPC URL"),
+            &["code"],
+        )
+        .expect("could not create request_errors counter");
+
         registry
             .register(Box::new(request_errors.clone()))
             .expect("could not register request_errors counter");
 
         Self {
-            request_total,
-            request_latency,
-            request_errors,
+            request_errors: Arc::new(request_errors),
+            default_policy: HttpRateLimitRetryPolicy::default(),
         }
+    }
+}
+
+/// We implement the [`HttpRateLimitRetryPolicy`] trait for our measured retry policy.
+/// This will allow us to use our custom retry policy with the [`RetryClient`].
+/// We will simply increment the counter for the error code, then return the default
+/// retry policy.
+impl RetryPolicy<HttpClientError> for MeasuredHttpRateLimitRetryPolicy {
+    fn should_retry(&self, error: &HttpClientError) -> bool {
+        fn should_retry_json_rpc_error(err: &JsonRpcError, req_errs: Arc<IntCounterVec>) -> bool {
+            let JsonRpcError { code, message, .. } = err;
+
+            log::debug!("JSON RPC error: code={}, message={}", code, message);
+            req_errs.with_label_values(&[&code.to_string()]).inc();
+
+            // alchemy throws it this way
+            if *code == 429 {
+                return true;
+            }
+
+            // This is an infura error code for `exceeded project rate limit`
+            if *code == -32005 {
+                return true;
+            }
+
+            // alternative alchemy error for specific IPs
+            if *code == -32016 && message.contains("rate limit") {
+                return true;
+            }
+
+            match message.as_str() {
+                // this is commonly thrown by infura and is apparently a load balancer issue, see also <https://github.com/MetaMask/metamask-extension/issues/7234>
+                "header not found" => true,
+                // also thrown by infura if out of budget for the day and ratelimited
+                "daily request count exceeded, request rate limited" => true,
+                _ => false,
+            }
+        }
+
+        match error {
+            HttpClientError::ReqwestError(err) => {
+                let status = err
+                    .status()
+                    .map(|s| s.as_u16().to_string())
+                    .unwrap_or_default();
+                log::debug!("Reqwest error: {:?}", err);
+                self.request_errors.with_label_values(&[&status]).inc();
+                err.status() == Some(http::StatusCode::TOO_MANY_REQUESTS)
+            }
+            HttpClientError::JsonRpcError(err) => {
+                should_retry_json_rpc_error(err, self.request_errors.clone())
+            }
+            HttpClientError::SerdeJson { text, .. } => {
+                // some providers send invalid JSON RPC in the error case (no `id:u64`), but the
+                // text should be a `JsonRpcError`
+                #[derive(Deserialize)]
+                struct Resp {
+                    error: JsonRpcError,
+                }
+
+                // log the first 100 chars of the error
+                log::debug!("SerdeJSON error: {}", &text);
+
+                if let Ok(resp) = serde_json::from_str::<Resp>(text) {
+                    return should_retry_json_rpc_error(&resp.error, self.request_errors.clone());
+                }
+                self.request_errors.with_label_values(&["unknown"]).inc();
+                false
+            }
+        }
+    }
+
+    fn backoff_hint(&self, error: &HttpClientError) -> Option<Duration> {
+        self.default_policy.backoff_hint(error)
     }
 }
 
@@ -127,7 +219,10 @@ impl MeasuredJsonRpc {
                 .rate_limit_retries(10)
                 .timeout_retries(3)
                 .initial_backoff(Duration::from_millis(500))
-                .build(http, Box::<HttpRateLimitRetryPolicy>::default()),
+                .build(
+                    http,
+                    Box::new(MeasuredHttpRateLimitRetryPolicy::new(registry)),
+                ),
         );
 
         let metrics = Metrics::new(registry);
@@ -157,55 +252,6 @@ impl JsonRpcClient for MeasuredJsonRpc {
         let res = self.client.request(method, params).await;
         timer.observe_duration();
         self.metrics.request_total.inc();
-
-        match &res {
-            Ok(_) => {}
-            Err(error) => {
-                // track error by status code, etc.
-                match error {
-                    RetryClientError::ProviderError(err) => {
-                        // check for json rpc error codes
-                        if let Some(code) = err.as_error_response().map(|e| e.code) {
-                            log::debug!("json rpc error: {}", code);
-                            self.metrics
-                                .request_errors
-                                .with_label_values(&[&code.to_string()])
-                                .inc();
-                        } else if let ProviderError::HTTPError(_err) = err {
-                            // check for http error codes
-                            if let Some(status) = _err.status() {
-                                log::debug!("http error: {}", status);
-                                self.metrics
-                                    .request_errors
-                                    .with_label_values(&[&status.as_str()])
-                                    .inc();
-                            }
-                        } else {
-                            log::debug!("unknown error");
-                            self.metrics
-                                .request_errors
-                                .with_label_values(&["unknown"])
-                                .inc();
-                        }
-                    }
-                    RetryClientError::SerdeJson(_) => {
-                        log::debug!("serde json error");
-                        self.metrics
-                            .request_errors
-                            .with_label_values(&["serde_json"])
-                            .inc();
-                    }
-                    &RetryClientError::TimeoutError => {
-                        log::debug!("timeout error");
-                        self.metrics
-                            .request_errors
-                            .with_label_values(&["timeout"])
-                            .inc();
-                    }
-                }
-            }
-        }
-
         res.map_err(Into::into)
     }
 }
